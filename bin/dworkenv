@@ -1,0 +1,301 @@
+#!/usr/bin/env ruby
+# frozen_string_literal: true
+
+require "digest"
+require "fileutils"
+require "json"
+require "net/http"
+require "open3"
+require "yaml"
+
+class WorktreeEnvironment
+  LABEL = "org.discourse.workenv.path"
+  WORKSPACE = "/workspace/discourse"
+
+  def initialize
+    @root = File.realpath(capture("git", "rev-parse", "--show-toplevel").strip)
+    @name = "discourse-workenv-#{Digest::SHA256.hexdigest(@root)[0, 16]}"
+  end
+
+  def run(command, arguments)
+    FileUtils.mkdir_p("#{@root}/tmp/workenv")
+    File.open("#{@root}/tmp/workenv/lock", "w") do |lock|
+      lock.flock(File::LOCK_EX)
+      case command
+      when "up"
+        start
+        prepare
+        start_web
+        puts url
+      when "exec"
+        start
+        prepare
+      when "url"
+        puts url
+      when "stop"
+        docker("stop", @name) if container
+      when "destroy"
+        docker("rm", "--force", @name) if container
+        volumes =
+          capture("docker", "volume", "ls", "--quiet", "--filter", "label=#{LABEL}=#{@root}").split
+        docker("volume", "rm", *volumes) unless volumes.empty?
+      end
+    end
+
+    if command == "exec"
+      arguments.shift if arguments.first == "--"
+      flags = $stdin.tty? && $stdout.tty? ? ["-it"] : ["-i"]
+      exec(
+        "docker",
+        "exec",
+        *flags,
+        "--user",
+        "discourse",
+        "--workdir",
+        WORKSPACE,
+        @name,
+        *arguments,
+      )
+    end
+  end
+
+  private
+
+  def capture(*command)
+    output, status = Open3.capture2(*command)
+    raise "Command failed: #{command.first(2).join(" ")}" unless status.success?
+    output
+  end
+
+  def docker(*arguments)
+    unless system("docker", *arguments, out: $stderr)
+      raise "Docker command failed: #{arguments.first}"
+    end
+  end
+
+  def container
+    ids = capture("docker", "ps", "--all", "--quiet", "--filter", "name=^/#{@name}$").strip
+    return if ids.empty?
+    info = JSON.parse(capture("docker", "inspect", @name)).first
+    if info.dig("Config", "Labels", LABEL) != @root
+      raise "Container name is already in use by another environment"
+    end
+    info
+  end
+
+  def volume_mounts
+    packages = YAML.safe_load_file("#{@root}/pnpm-workspace.yaml").fetch("packages")
+    dependency_paths =
+      ["node_modules"] +
+        packages.flat_map do |pattern|
+          Dir.glob(pattern, base: @root).map { |path| "#{path}/node_modules" }
+        end
+    mounts = {
+      "postgres" => "/shared/postgres_data",
+      "redis" => "/shared/redis_data",
+      "gems" => "/home/discourse/.bundle/gems",
+      "cache" => "/home/discourse/.cache",
+      "tmp" => "#{WORKSPACE}/tmp",
+      "log" => "#{WORKSPACE}/log",
+    }
+    dependency_paths.each do |path|
+      mounts["node-#{Digest::SHA256.hexdigest(path)[0, 12]}"] = "#{WORKSPACE}/#{path}"
+    end
+    mounts
+  end
+
+  def start
+    if info = container
+      docker("start", @name) unless info.dig("State", "Running")
+    else
+      config = File.read("#{@root}/.devcontainer/devcontainer.json")
+      image = ENV["DWORKENV_IMAGE"] || ENV["WORKENV_IMAGE"] || config[/"image"\s*:\s*"([^"]+)"/, 1]
+      raise "No development image configured" unless image
+      mounts = volume_mounts
+      arguments = [
+        "run",
+        "--detach",
+        "--name",
+        @name,
+        "--label",
+        "#{LABEL}=#{@root}",
+        "--label",
+        "dev.orbstack.http-port=3000",
+        "--publish",
+        "127.0.0.1::3000",
+        "--shm-size",
+        "1g",
+        "--workdir",
+        WORKSPACE,
+        "--env",
+        "HOME=/home/discourse",
+        "--env",
+        "PGUSER=discourse",
+        "--env",
+        "UNICORN_BIND_ALL=1",
+        "--env",
+        "UNICORN_WORKERS=2",
+        "--env",
+        "RAILS_DEVELOPMENT_HOSTS=localhost,127.0.0.1",
+        "--env",
+        "BUNDLE_APP_CONFIG=/home/discourse/.bundle",
+        "--env",
+        "BUNDLE_PATH=/home/discourse/.bundle/gems",
+        "--mount",
+        "type=bind,source=#{@root},target=#{WORKSPACE}",
+      ]
+      common = File.realpath(capture("git", "rev-parse", "--git-common-dir").strip)
+      arguments.concat(["--mount", "type=bind,source=#{common},target=#{common},readonly"])
+      if File.directory?("#{@root}/.git")
+        arguments.concat(
+          ["--mount", "type=bind,source=#{common},target=#{WORKSPACE}/.git,readonly"],
+        )
+      end
+      arguments.concat(
+        [
+          "--env",
+          "GIT_CONFIG_COUNT=1",
+          "--env",
+          "GIT_CONFIG_KEY_0=safe.directory",
+          "--env",
+          "GIT_CONFIG_VALUE_0=#{WORKSPACE}",
+        ],
+      )
+      mounts.each do |suffix, target|
+        volume = "#{@name}-#{suffix}"
+        capture("docker", "volume", "create", "--label", "#{LABEL}=#{@root}", volume)
+        arguments.concat(["--mount", "type=volume,source=#{volume},target=#{target}"])
+      end
+      docker(*arguments, image, "/sbin/boot")
+    end
+    mounted =
+      container
+        .fetch("Mounts")
+        .select { |mount| mount["Type"] == "volume" }
+        .map { |mount| mount["Destination"] }
+    unless (volume_mounts.values - mounted).empty?
+      raise "Workspace packages changed; destroy and recreate this environment to isolate their dependencies"
+    end
+    writable = mounted.reject { |path| path.start_with?("/shared/") }
+    docker("exec", @name, "chown", "discourse:discourse", *writable)
+    docker("exec", @name, "bash", "-ec", <<~SH)
+      for attempt in {1..60}; do
+        if pg_isready -q && redis-cli ping | grep -q PONG; then exit 0; fi
+        sleep 1
+      done
+      echo 'PostgreSQL or Redis did not become ready' >&2
+      exit 1
+    SH
+  end
+
+  def inside(*arguments)
+    docker("exec", "--user", "discourse", "--workdir", WORKSPACE, @name, *arguments)
+  end
+
+  def prepare
+    files = %w[Gemfile.lock pnpm-lock.yaml pnpm-workspace.yaml]
+    files += Dir.glob("{db/migrate,db/post_migrate}/*.rb", base: @root)
+    fingerprint = Digest::SHA256.new
+    files.sort.each { |path| fingerprint.update(path).update(File.read("#{@root}/#{path}")) }
+    inside("bash", "-ec", <<~SH, "workenv", fingerprint.hexdigest)
+      marker=/home/discourse/.workenv-ready
+      if [ -f "$marker" ] && [ "$(cat "$marker")" = "$1" ]; then exit 0; fi
+      bundle check || bundle install --jobs 4
+      CI=1 pnpm install --frozen-lockfile
+      SKIP_MULTISITE=1 SKIP_TEST_DATABASE=1 bin/rake db:create db:migrate
+      RAILS_ENV=test bin/rake db:create db:migrate
+      printf '%s' "$1" > "$marker"
+    SH
+  end
+
+  def start_web
+    hostname = orbstack? ? "#{@name}.orb.local" : "localhost"
+    docker("exec", @name, "bash", "-ec", <<~SH)
+      mkdir -p /etc/service/workenv-web
+      cat > /etc/service/workenv-web/run.new <<'RUN'
+      #!/bin/sh
+      cd #{WORKSPACE}
+      export RAILS_DEVELOPMENT_HOSTS=localhost,127.0.0.1,#{hostname}
+      export DISCOURSE_HOSTNAME=#{hostname}
+      export DISCOURSE_PORT=#{orbstack? ? 443 : 3000}
+      export DISCOURSE_FORCE_HTTPS=#{orbstack? ? 1 : 0}
+      export DISCOURSE_DEV_ALLOW_HTTPS=1
+      exec chpst -u discourse:discourse bin/dev >> log/workenv-web.log 2>&1
+      RUN
+      action=up
+      if ! cmp -s /etc/service/workenv-web/run.new /etc/service/workenv-web/run; then
+        chmod +x /etc/service/workenv-web/run.new
+        mv /etc/service/workenv-web/run.new /etc/service/workenv-web/run
+        action=restart
+      else
+        rm /etc/service/workenv-web/run.new
+      fi
+      for attempt in {1..10}; do
+        if sv "$action" /etc/service/workenv-web; then exit 0; fi
+        sleep 1
+      done
+      exit 1
+    SH
+    warn "Waiting for #{url} (logs: docker exec #{@name} tail -f #{WORKSPACE}/log/workenv-web.log)..."
+    # OrbStack terminates TLS; readiness checks the app through its HTTP proxy.
+    address = URI(url.sub(/\Ahttps:/, "http:"))
+    deadline = Process.clock_gettime(Process::CLOCK_MONOTONIC) + 240
+    loop do
+      begin
+        response =
+          Net::HTTP.start(
+            address.host,
+            address.port,
+            nil,
+            open_timeout: 2,
+            read_timeout: 5,
+          ) { |http| http.get("/") }
+        return if response.code.to_i.between?(200, 399)
+      rescue SystemCallError, IOError, Timeout::Error, SocketError
+      end
+      if Process.clock_gettime(Process::CLOCK_MONOTONIC) >= deadline
+        raise "Web server did not become ready; inspect log/workenv-web.log"
+      end
+      sleep 2
+    end
+  end
+
+  def url
+    info = container
+    raise "Environment is not running; use dworkenv up" unless info&.dig("State", "Running")
+    return "https://#{@name}.orb.local" if orbstack?
+    port = info&.dig("NetworkSettings", "Ports", "3000/tcp")&.first&.fetch("HostPort")
+    raise "Environment is not running; use dworkenv up" unless port
+    "http://localhost:#{port}"
+  end
+
+  def orbstack?
+    @operating_system ||= capture("docker", "info", "--format", "{{.OperatingSystem}}").strip
+    @operating_system == "OrbStack"
+  end
+end
+
+command = ARGV.shift
+unless %w[up exec url stop destroy].include?(command)
+  puts <<~HELP
+    Usage: dworkenv <up|exec|url|stop|destroy>
+
+      up                 Prepare this worktree and start its web server
+      exec -- COMMAND    Prepare this worktree and run a command inside it
+      url                Print the running environment's URL
+      stop               Stop the container, retaining its data
+      destroy            Delete this worktree's container and all its volumes
+
+    Run from any directory within a Discourse checkout or worktree.
+    DWORKENV_IMAGE overrides the image for newly created containers.
+  HELP
+  exit(command.nil? || %w[help --help -h].include?(command) ? 0 : 1)
+end
+abort "Supply a command after exec --" if command == "exec" && (ARGV - ["--"]).empty?
+abort "Unexpected arguments" if command != "exec" && !ARGV.empty?
+
+begin
+  WorktreeEnvironment.new.run(command, ARGV)
+rescue StandardError => e
+  abort "dworkenv: #{e.message}"
+end
