@@ -6,20 +6,119 @@ require "fileutils"
 require "json"
 require "net/http"
 require "open3"
+require "time"
 require "yaml"
+
+class DiscourseProject
+  attr_reader :root, :discourse_root, :plugin_name, :state_directory
+
+  def initialize
+    @root = File.realpath(git("rev-parse", "--show-toplevel").strip)
+    if File.file?(File.join(@root, "plugin.rb"))
+      @plugin_name = File.read(File.join(@root, "plugin.rb"))[/^#\s*name:\s*([^\r\n]+)/, 1]&.strip
+      unless @plugin_name&.match?(/\A[a-zA-Z0-9][a-zA-Z0-9_-]*\z/)
+        raise "plugin.rb must declare a name containing only letters, numbers, underscores, and hyphens"
+      end
+      cache = ENV["DWORKENV_CACHE_HOME"] || File.join(ENV.fetch("XDG_CACHE_HOME", File.join(Dir.home, ".cache")), "dworkenv")
+      @state_directory = File.join(File.expand_path(cache), Digest::SHA256.hexdigest(@root)[0, 16])
+      @discourse_root = File.join(@state_directory, "discourse")
+    elsif File.file?(File.join(@root, ".devcontainer/devcontainer.json")) && File.file?(File.join(@root, "bin/rspec"))
+      @discourse_root = @root
+      @state_directory = File.join(@root, "tmp/workenv")
+    else
+      raise "Run dworkenv from a Discourse checkout or a plugin repository containing plugin.rb"
+    end
+  end
+
+  def container_name
+    branch = git("branch", "--show-current").strip
+    branch = File.basename(@root) if branch.empty?
+    pr = branch.match(/(?:\A|[\/_-])(?:pr|pull)[\/_-]?(\d+)(?:\z|[\/_-])/i)
+    feature = pr ? "PR-#{pr[1]}" : branch.gsub(/[^a-zA-Z0-9-]+/, "-").gsub(/-+/, "-").sub(/\A-/, "").sub(/-\z/, "")
+    feature = "checkout" if feature.empty?
+    prefix = plugin? ? "discourse-#{@plugin_name.delete_prefix("discourse-")}" : "discourse"
+    "#{prefix}-#{feature}"[0, 180]
+  end
+
+  def plugin?
+    !@plugin_name.nil?
+  end
+
+  def ensure_checkout
+    return unless plugin?
+    return if File.directory?(File.join(@discourse_root, ".git"))
+    raise "Managed checkout exists without Git metadata: #{@discourse_root}" if File.exist?(@discourse_root)
+
+    repository = ENV.fetch("DWORKENV_DISCOURSE_REPOSITORY", "https://github.com/discourse/discourse.git")
+    ref = ENV.fetch("DWORKENV_DISCOURSE_REF", "main")
+    temporary = File.join(@state_directory, "discourse-cloning")
+    raise "Interrupted clone found at #{temporary}; remove it before retrying" if File.exist?(temporary)
+    warn "Preparing Discourse #{ref} for #{@plugin_name}..."
+    begin
+      git("init", "--quiet", temporary)
+      git("-C", temporary, "remote", "add", "origin", repository)
+      git("-C", temporary, "fetch", "--depth=1", "origin", ref)
+      git("-C", temporary, "checkout", "--detach", "--quiet", "FETCH_HEAD")
+      unless File.file?(File.join(temporary, ".devcontainer/devcontainer.json")) && File.file?(File.join(temporary, "bin/rspec"))
+        raise "The selected Discourse revision does not provide the development environment files"
+      end
+      File.rename(temporary, @discourse_root)
+      warn "Discourse revision: #{git("-C", @discourse_root, "rev-parse", "HEAD").strip}"
+    ensure
+      FileUtils.rm_rf(temporary)
+    end
+  end
+
+  def spec_arguments(arguments)
+    paths, options = split_specs(arguments)
+    paths = paths.map { |path| plugin? ? "plugins/#{@plugin_name}/#{path.delete_prefix("#{@root}/")}" : path }
+    [*paths, *options]
+  end
+
+  def system_specs?(arguments)
+    paths, = split_specs(arguments)
+    paths.any? do |argument|
+      path = argument.sub(/:\d+(?::\d+)*\z/, "")
+      path = File.expand_path(path, @root)
+      pattern = File.directory?(path) ? File.join(path, "**/*_spec.rb") : path
+      Dir.glob(pattern).any? { |file| file.include?("/spec/system/") }
+    end
+  end
+
+  private
+
+  def split_specs(arguments)
+    separator = arguments.index("--") || arguments.length
+    paths = arguments.take(separator)
+    options = arguments.drop(separator + 1)
+    raise "Put RSpec options after -- (for example: dworkenv test spec/models -- --format progress)" if paths.any? { |path| path.start_with?("-") }
+    paths = ["spec"] if paths.empty?
+    [paths, options]
+  end
+
+  def git(*arguments)
+    output, status = Open3.capture2("git", *arguments)
+    raise "Git command failed: #{arguments.first}" unless status.success?
+    output
+  end
+end
 
 class WorktreeEnvironment
   LABEL = "org.discourse.workenv.path"
   WORKSPACE = "/workspace/discourse"
 
   def initialize
-    @root = File.realpath(capture("git", "rev-parse", "--show-toplevel").strip)
-    @name = "discourse-workenv-#{Digest::SHA256.hexdigest(@root)[0, 16]}"
+    @project = DiscourseProject.new
+    @root = @project.root
+    @source = @project.discourse_root
+    @volume_prefix = "discourse-workenv-#{Digest::SHA256.hexdigest(@root)[0, 16]}"
+    @name = @project.container_name
   end
 
   def run(command, arguments)
-    FileUtils.mkdir_p("#{@root}/tmp/workenv")
-    File.open("#{@root}/tmp/workenv/lock", "w") do |lock|
+    spec_arguments = @project.spec_arguments(arguments) if command == "test"
+    FileUtils.mkdir_p(@project.state_directory)
+    File.open(File.join(@project.state_directory, "lock"), "w") do |lock|
       lock.flock(File::LOCK_EX)
       case command
       when "up"
@@ -27,9 +126,13 @@ class WorktreeEnvironment
         prepare
         start_web
         puts url
-      when "exec"
+      when "exec", "test", "qunit"
         start
         prepare
+        if command == "qunit" || (command == "test" && @project.system_specs?(arguments))
+          prepare_browser
+          start_web
+        end
       when "url"
         puts url
       when "stop"
@@ -39,11 +142,22 @@ class WorktreeEnvironment
         volumes =
           capture("docker", "volume", "ls", "--quiet", "--filter", "label=#{LABEL}=#{@root}").split
         docker("volume", "rm", *volumes) unless volumes.empty?
+        FileUtils.rm_rf(@source) if @project.plugin?
       end
     end
 
-    if command == "exec"
-      arguments.shift if arguments.first == "--"
+    if %w[exec test qunit].include?(command)
+      arguments.shift if command != "test" && arguments.first == "--"
+      arguments = ["bin/rspec", *spec_arguments] if command == "test"
+      if command == "qunit"
+        arguments = ["bash", "-ec", <<~SH, "dworkenv-qunit", *arguments]
+          export GIT_ALTERNATE_OBJECT_DIRECTORIES="$(git rev-parse --path-format=absolute --git-common-dir)/objects"
+          export GIT_OBJECT_DIRECTORY=/home/discourse/.cache/dworkenv/git-objects
+          export DISCOURSE_DISABLE_BROWSER_SANDBOX=1
+          mkdir -p "$GIT_OBJECT_DIRECTORY"
+          exec bin/qunit --standalone --target #{@project.plugin_name || "core"} "$@"
+        SH
+      end
       flags = $stdin.tty? && $stdout.tty? ? ["-it"] : ["-i"]
       exec(
         "docker",
@@ -53,6 +167,7 @@ class WorktreeEnvironment
         "discourse",
         "--workdir",
         WORKSPACE,
+        *plugin_environment,
         @name,
         *arguments,
       )
@@ -74,21 +189,52 @@ class WorktreeEnvironment
   end
 
   def container
-    ids = capture("docker", "ps", "--all", "--quiet", "--filter", "name=^/#{@name}$").strip
+    ids = capture("docker", "ps", "--all", "--quiet", "--filter", "label=#{LABEL}=#{@root}").split
+    raise "Multiple containers belong to this checkout" if ids.length > 1
     return if ids.empty?
-    info = JSON.parse(capture("docker", "inspect", @name)).first
-    if info.dig("Config", "Labels", LABEL) != @root
-      raise "Container name is already in use by another environment"
-    end
+    info = JSON.parse(capture("docker", "inspect", ids.first)).first
+    @name = info.fetch("Name").delete_prefix("/")
     info
   end
 
+  def available_name
+    desired = @project.container_name
+    ids = capture("docker", "ps", "--all", "--quiet", "--filter", "name=^/#{desired}$").strip
+    if !ids.empty? && JSON.parse(capture("docker", "inspect", ids)).first.dig("Config", "Labels", LABEL) != @root
+      desired = "#{desired}-#{Digest::SHA256.hexdigest(@root)[0, 8]}"
+    end
+    desired
+  end
+
+  def ensure_image(image)
+    cache = ENV["DWORKENV_CACHE_HOME"] || File.join(ENV.fetch("XDG_CACHE_HOME", File.join(Dir.home, ".cache")), "dworkenv")
+    directory = File.join(File.expand_path(cache), "images")
+    FileUtils.mkdir_p(directory)
+    key = Digest::SHA256.hexdigest(image)
+    File.open(File.join(directory, "#{key}.lock"), "w") do |lock|
+      lock.flock(File::LOCK_EX)
+      marker = File.join(directory, "#{key}.json")
+      output, _error, status = Open3.capture3("docker", "image", "inspect", image)
+      info = JSON.parse(output).first if status.success?
+      checked = JSON.parse(File.read(marker)) if File.file?(marker)
+      since = Time.parse(info.fetch("Created")) if info
+      if info && checked && checked["id"] == info["Id"]
+        since = [since, Time.at(checked.fetch("checked_at"))].max
+      end
+      return if since && since <= Time.now && Time.now - since <= 48 * 60 * 60
+
+      docker("pull", image)
+      info = JSON.parse(capture("docker", "image", "inspect", image)).first
+      File.write(marker, JSON.generate(id: info.fetch("Id"), checked_at: Time.now.to_f))
+    end
+  end
+
   def volume_mounts
-    packages = YAML.safe_load_file("#{@root}/pnpm-workspace.yaml").fetch("packages")
+    packages = YAML.safe_load_file("#{@source}/pnpm-workspace.yaml").fetch("packages")
     dependency_paths =
       ["node_modules"] +
         packages.flat_map do |pattern|
-          Dir.glob(pattern, base: @root).map { |path| "#{path}/node_modules" }
+          Dir.glob(pattern, base: @source).map { |path| "#{path}/node_modules" }
         end
     mounts = {
       "postgres" => "/shared/postgres_data",
@@ -101,16 +247,48 @@ class WorktreeEnvironment
     dependency_paths.each do |path|
       mounts["node-#{Digest::SHA256.hexdigest(path)[0, 12]}"] = "#{WORKSPACE}/#{path}"
     end
+    if @project.plugin?
+      %w[gems auto_generated node_modules].each do |directory|
+        target = "#{plugin_path}/#{directory}"
+        mounts["plugin-#{directory}"] = target unless mounts.value?(target)
+      end
+    end
+    mounts
+  end
+
+  def plugin_path
+    "#{WORKSPACE}/plugins/#{@project.plugin_name}"
+  end
+
+  def plugin_environment
+    return [] unless @project.plugin?
+    ["--env", "LOAD_PLUGINS=1", "--env", "DWORKENV_PLUGIN_PATH=#{plugin_path}"]
+  end
+
+  def git_mounts(root, target)
+    common = capture("git", "-C", root, "rev-parse", "--path-format=absolute", "--git-common-dir").strip
+    mounts = ["--mount", "type=bind,source=#{common},target=#{common},readonly"]
+    if File.directory?("#{root}/.git")
+      mounts.concat(["--mount", "type=bind,source=#{common},target=#{target}/.git,readonly"])
+    end
     mounts
   end
 
   def start
+    @project.ensure_checkout
     if info = container
+      desired = available_name
+      if @name != desired
+        docker("rename", @name, desired)
+        @name = desired
+      end
       docker("start", @name) unless info.dig("State", "Running")
     else
-      config = File.read("#{@root}/.devcontainer/devcontainer.json")
+      @name = available_name
+      config = File.read("#{@source}/.devcontainer/devcontainer.json")
       image = ENV["DWORKENV_IMAGE"] || ENV["WORKENV_IMAGE"] || config[/"image"\s*:\s*"([^"]+)"/, 1]
       raise "No development image configured" unless image
+      ensure_image(image)
       mounts = volume_mounts
       arguments = [
         "run",
@@ -142,27 +320,29 @@ class WorktreeEnvironment
         "--env",
         "BUNDLE_PATH=/home/discourse/.bundle/gems",
         "--mount",
-        "type=bind,source=#{@root},target=#{WORKSPACE}",
+        "type=bind,source=#{@source},target=#{WORKSPACE}",
       ]
-      common = File.realpath(capture("git", "rev-parse", "--git-common-dir").strip)
-      arguments.concat(["--mount", "type=bind,source=#{common},target=#{common},readonly"])
-      if File.directory?("#{@root}/.git")
-        arguments.concat(
-          ["--mount", "type=bind,source=#{common},target=#{WORKSPACE}/.git,readonly"],
-        )
+      arguments.concat(git_mounts(@source, WORKSPACE))
+      if @project.plugin?
+        arguments.concat(["--mount", "type=bind,source=#{@root},target=#{plugin_path}"])
+        arguments.concat(git_mounts(@root, plugin_path))
+        arguments.concat(plugin_environment)
       end
       arguments.concat(
         [
           "--env",
-          "GIT_CONFIG_COUNT=1",
+          "GIT_CONFIG_COUNT=#{@project.plugin? ? 2 : 1}",
           "--env",
           "GIT_CONFIG_KEY_0=safe.directory",
           "--env",
           "GIT_CONFIG_VALUE_0=#{WORKSPACE}",
         ],
       )
+      if @project.plugin?
+        arguments.concat(["--env", "GIT_CONFIG_KEY_1=safe.directory", "--env", "GIT_CONFIG_VALUE_1=#{plugin_path}"])
+      end
       mounts.each do |suffix, target|
-        volume = "#{@name}-#{suffix}"
+        volume = "#{@volume_prefix}-#{suffix}"
         capture("docker", "volume", "create", "--label", "#{LABEL}=#{@root}", volume)
         arguments.concat(["--mount", "type=volume,source=#{volume},target=#{target}"])
       end
@@ -189,23 +369,58 @@ class WorktreeEnvironment
   end
 
   def inside(*arguments)
-    docker("exec", "--user", "discourse", "--workdir", WORKSPACE, @name, *arguments)
+    docker("exec", "--user", "discourse", "--workdir", WORKSPACE, *plugin_environment, @name, *arguments)
   end
 
   def prepare
     files = %w[Gemfile.lock pnpm-lock.yaml pnpm-workspace.yaml]
-    files += Dir.glob("{db/migrate,db/post_migrate}/*.rb", base: @root)
+    files += Dir.glob("{db/migrate,db/post_migrate}/*.rb", base: @source)
     fingerprint = Digest::SHA256.new
-    files.sort.each { |path| fingerprint.update(path).update(File.read("#{@root}/#{path}")) }
+    fingerprint.update("admin-seed-v1")
+    files.sort.each { |path| fingerprint.update(path).update(File.read("#{@source}/#{path}")) }
+    if @project.plugin?
+      fingerprint.update("plugin-environment-v1")
+      files = %w[plugin.rb Gemfile Gemfile.lock package.json pnpm-lock.yaml]
+      files += Dir.glob("{db/migrate,db/post_migrate}/*.rb", base: @root)
+      files.sort.each do |path|
+        fingerprint.update("plugin/#{path}").update(File.read("#{@root}/#{path}")) if File.file?("#{@root}/#{path}")
+      end
+    end
     inside("bash", "-ec", <<~SH, "workenv", fingerprint.hexdigest)
       marker=/home/discourse/.workenv-ready
       if [ -f "$marker" ] && [ "$(cat "$marker")" = "$1" ]; then exit 0; fi
       bundle check || bundle install --jobs 4
       CI=1 pnpm install --frozen-lockfile
+      if [ -n "${DWORKENV_PLUGIN_PATH:-}" ] && [ -f "$DWORKENV_PLUGIN_PATH/package.json" ]; then
+        if [ -f "$DWORKENV_PLUGIN_PATH/pnpm-lock.yaml" ]; then
+          (cd "$DWORKENV_PLUGIN_PATH" && CI=1 pnpm --ignore-workspace install --frozen-lockfile --store-dir /home/discourse/.cache/pnpm-store)
+        else
+          (cd "$DWORKENV_PLUGIN_PATH" && CI=1 pnpm --ignore-workspace install --lockfile=false --store-dir /home/discourse/.cache/pnpm-store)
+        fi
+      fi
       SKIP_MULTISITE=1 SKIP_TEST_DATABASE=1 bin/rake db:create db:migrate
       RAILS_ENV=test bin/rake db:create db:migrate
+      RAILS_ENV=development bin/rails runner - <<'DWORKENV_ADMIN'
+#{admin_seed}DWORKENV_ADMIN
       printf '%s' "$1" > "$marker"
     SH
+  end
+
+  def admin_seed
+    <<~RUBY
+      User.transaction do
+        next if User.find_by(username_lower: "admin")
+        user = User.new(username: "admin", email: "admin@localhost.local", name: "Admin",
+                        password: SecureRandom.hex(32), active: true, approved: true,
+                        approved_at: Time.current, trust_level: 1)
+        user.save!
+        # Set the requested local password without changing site password policy.
+        user.user_password.password = "passwordpassword"
+        user.user_password.save!(validate: false)
+        user.grant_admin!
+        user.activate
+      end
+    RUBY
   end
 
   def start_web
@@ -236,6 +451,7 @@ class WorktreeEnvironment
       done
       exit 1
     SH
+    inside("bin/rake", "assets:precompile:build_plugins") if @project.plugin?
     warn "Waiting for #{url} (logs: docker exec #{@name} tail -f #{WORKSPACE}/log/workenv-web.log)..."
     # OrbStack terminates TLS; readiness checks the app through its HTTP proxy.
     address = URI(url.sub(/\Ahttps:/, "http:"))
@@ -260,6 +476,20 @@ class WorktreeEnvironment
     end
   end
 
+  def prepare_browser
+    fingerprint = Digest::SHA256.file("#{@source}/pnpm-lock.yaml").hexdigest
+    inside("bash", "-ec", <<~SH, "dworkenv-browser", fingerprint)
+      marker=/home/discourse/.workenv-browser-ready
+      if [ ! -f "$marker" ] || [ "$(cat "$marker")" != "$1" ]; then
+        pnpm playwright-install
+        sudo pnpm exec playwright install-deps chromium
+        printf '%s' "$1" > "$marker"
+      fi
+      chromium=$(node -e 'process.stdout.write(require("playwright").chromium.executablePath())')
+      sudo ln -sfn "$chromium" /usr/bin/google-chrome
+    SH
+  end
+
   def url
     info = container
     raise "Environment is not running; use dworkenv up" unless info&.dig("State", "Running")
@@ -275,27 +505,34 @@ class WorktreeEnvironment
   end
 end
 
-command = ARGV.shift
-unless %w[up exec url stop destroy].include?(command)
-  puts <<~HELP
-    Usage: dworkenv <up|exec|url|stop|destroy>
+if $PROGRAM_NAME == __FILE__
+  command = ARGV.shift
+  unless %w[up exec test qunit url stop destroy].include?(command)
+    puts <<~HELP
+      Usage: dworkenv <up|exec|test|qunit|url|stop|destroy>
 
-      up                 Prepare this worktree and start its web server
-      exec -- COMMAND    Prepare this worktree and run a command inside it
-      url                Print the running environment's URL
-      stop               Stop the container, retaining its data
-      destroy            Delete this worktree's container and all its volumes
+        up                 Prepare this worktree and start its web server
+        exec -- COMMAND    Prepare this worktree and run a command inside it
+        test [SPECS...]     Run RSpec; pass runner options after --
+        qunit [OPTIONS...] Run JavaScript tests for this plugin or core
+        url                Print the running environment's URL
+        stop               Stop the container, retaining its data
+        destroy            Delete this worktree's container and all its volumes
 
-    Run from any directory within a Discourse checkout or worktree.
-    DWORKENV_IMAGE overrides the image for newly created containers.
-  HELP
-  exit(command.nil? || %w[help --help -h].include?(command) ? 0 : 1)
-end
-abort "Supply a command after exec --" if command == "exec" && (ARGV - ["--"]).empty?
-abort "Unexpected arguments" if command != "exec" && !ARGV.empty?
+      Run from any directory within a Discourse or plugin checkout/worktree.
+      Plugin environments download and pin Discourse automatically.
+      DWORKENV_DISCOURSE_REF selects the initial Discourse branch, tag, or commit.
+      DWORKENV_CACHE_HOME overrides the managed checkout/cache directory.
+      DWORKENV_IMAGE overrides the image for newly created containers.
+    HELP
+    exit(command.nil? || %w[help --help -h].include?(command) ? 0 : 1)
+  end
+  abort "Supply a command after exec --" if command == "exec" && (ARGV - ["--"]).empty?
+  abort "Unexpected arguments" if !%w[exec test qunit].include?(command) && !ARGV.empty?
 
-begin
-  WorktreeEnvironment.new.run(command, ARGV)
-rescue StandardError => e
-  abort "dworkenv: #{e.message}"
+  begin
+    WorktreeEnvironment.new.run(command, ARGV)
+  rescue StandardError => e
+    abort "dworkenv: #{e.message}"
+  end
 end
