@@ -382,7 +382,7 @@ class WorktreeEnvironment
         "--env",
         "UNICORN_BIND_ALL=1",
         "--env",
-        "UNICORN_WORKERS=2",
+        "UNICORN_WORKERS=1",
         "--env",
         "RAILS_DEVELOPMENT_HOSTS=localhost,127.0.0.1",
         "--env",
@@ -571,6 +571,7 @@ class WorktreeEnvironment
       export DISCOURSE_PORT=#{endpoint.uri.port}
       export DISCOURSE_FORCE_HTTPS=#{endpoint.https? ? 1 : 0}
       export DISCOURSE_DEV_ALLOW_HTTPS=1
+      export UNICORN_WORKERS=1
       exec chpst -u discourse:discourse bin/dev#{@settings["preview"] ? " --only=rails" : ""} >> log/workenv-web.log 2>&1
       RUN
       action=up

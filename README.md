@@ -44,6 +44,10 @@ New development databases include an active, approved administrator: username
 `admin`, password `passwordpassword`, email `admin@localhost.local`. Setup leaves
 an existing `admin` account unchanged and does not reset its password on restart.
 
+Web servers use one Rails worker to reduce memory use across worktrees.
+Running `dworkenv up` also applies this default to existing containers, restarting
+the web service when needed while retaining their databases and volumes.
+
 Subsequent commands reuse the container. Changes to dependency lockfiles or core
 migrations trigger setup again. Adding workspace packages requires recreating
 the environment so their dependency directories receive separate mounts.
