@@ -109,8 +109,107 @@ is set and `DWORKENV_PLUGIN_PATH` contains the mounted plugin directory:
 dworkenv exec -- bash -c 'cd "$DWORKENV_PLUGIN_PATH" && pwd'
 ```
 
-Only the current plugin is mounted automatically. Additional plugin repositories
-required by a plugin must be configured separately.
+Only the current plugin is mounted automatically for a standalone plugin
+checkout. In core checkouts, external plugin directory symlinks are also mounted
+at their container paths, with isolated dependency/generated directories. Edits
+remain live; no source snapshot is copied. Broken symlinks fail with a clear
+error. Adding or retargeting links requires recreating the environment to update
+its mounts. Other standalone plugin dependencies must be configured separately.
+
+## Preview mode
+
+Use a one-shot frontend build to browse multiple worktrees without keeping a
+frontend builder running in each container:
+
+```sh
+dworkenv up --preview
+```
+
+The launcher hashes source contents, including local edits, new/deleted files,
+dependency lockfiles, and linked plugin sources. It reuses the previous build
+when the fingerprint, image, manifest, and required JavaScript chunks match.
+Generated output and dependency directories are excluded from the source hash.
+Run `dworkenv up` after editing to rebuild as needed; preview mode does not watch
+frontend source continuously. Rails, Sidekiq, and existing plugin/CSS watchers
+continue running. This remains development mode, not a production deployment.
+
+The frontend builder exits after a successful build and the server runs with
+`bin/dev --only=rails`. A failed build leaves the web service down and does not
+save a successful cache marker. Fix the error and rerun `dworkenv up`.
+
+Use `dworkenv up --live` to restore continuous frontend rebuilding. The initial
+default is live mode; `--preview` and `--live` are saved per worktree across
+stop/start. Preview mode requires a checkout with the Rolldown frontend build.
+
+## Private Tailscale previews
+
+Tailscale integration is optional:
+
+```sh
+dworkenv up --preview --tailscale
+```
+
+Each worktree gets a userspace Tailscale companion and a private HTTPS hostname.
+It shares the application container's network namespace and forwards to port
+3000 using Tailscale Serve. No privileged container, host Tailscale installation,
+or public Funnel endpoint is required. The launcher configures Discourse's
+public hostname, port, HTTPS, and Rails host allowlist together.
+
+On first startup, authorize the printed sign-in URL, then rerun `dworkenv up`.
+Tailscale may also ask you to enable Serve/HTTPS for your tailnet. The companion
+remains running while sign-in is pending. `--tailscale` is saved per worktree;
+subsequent starts reuse its persistent identity. The initial DNS name is based
+on the application container name; the actual name assigned by Tailscale is
+used. Identity is keyed by canonical worktree path and survives branch renames.
+
+For unattended registration, create a reusable, non-ephemeral auth key in the
+Tailscale admin console, with suitable development tags and access rules. If
+device approval is enabled, make it pre-authorized. Save it using a hidden prompt:
+
+```sh
+dworkenv auth-key
+```
+
+The key is stored with mode 600 at
+`$XDG_CONFIG_HOME/dworkenv/tailscale-auth-key` (default
+`~/.config/dworkenv/tailscale-auth-key`). `DWORKENV_TAILSCALE_AUTH_KEY_FILE` selects
+another file. The key is sent over stdin into a temporary tmpfs file inside the
+companion, passed to Tailscale by filename, and removed after authentication.
+It is never put in command arguments, Docker environment variables, or Git.
+Running identities do not need the key. Replace an expired key using the same
+command when you need to register new identities.
+
+`stop` stops the companion first and retains its identity. `destroy` removes the
+companion and its state volume as well as the application environment; remove
+the obsolete device from your Tailscale admin console separately if needed.
+`dworkenv up --no-tailscale` stops the companion and restores local access while
+retaining its identity. Its state volume is preserved when its network attachment
+must be recreated for a replacement application container.
+`DWORKENV_TAILSCALE_IMAGE` overrides the image used for new companions.
+
+These remain development environments, including the seeded development admin
+account. Limit access with your tailnet policy. No tailnet policies, credentials,
+or account identifiers belong in the repository.
+
+## Other reverse proxies
+
+For an independently managed proxy, configure its public origin:
+
+```sh
+dworkenv up --preview --public-url https://preview.example.test:8443
+```
+
+This saves the URL and configures Discourse; it does not provision the proxy,
+DNS, or certificates. Forward your proxy to the mapped localhost port reported
+by `docker port <container> 3000/tcp`. Path prefixes are not supported.
+`dworkenv up --local` clears the custom URL and disables Tailscale.
+`--public-url` and `--tailscale` select alternative endpoints; when both are
+passed, the last option takes precedence.
+
+Options are saved in the existing worktree state directory as `preview.json`.
+Readiness uses the local published port with the public Host and scheme headers
+and a browser user-agent, requiring HTTP 200 rather than accepting a redirect.
+Verify a remote proxy URL from a permitted device as well.
 
 ## Lifecycle and isolation
 
@@ -209,13 +308,15 @@ Existing data is reused; OrbStack URLs adopt the new container names.
 
 ## Development
 
-The implementation is a standalone Ruby script using the standard library and
-Docker CLI. Keep process arguments as arrays and preserve child exit codes.
+The CLI and its support files under `lib/dworkenv` use Ruby's standard library
+and Docker CLI. Keep them together when installing, invoke process arguments as
+arrays, and preserve child exit codes.
 
 ```sh
 ruby -c bin/dworkenv
 bin/dworkenv --help
 ruby test/project_test.rb
+ruby test/preview_test.rb
 ```
 
 The regression tests require Minitest (`gem install minitest` if unavailable);

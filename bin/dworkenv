@@ -6,8 +6,14 @@ require "fileutils"
 require "json"
 require "net/http"
 require "open3"
+require "optparse"
+require "pathname"
+require "shellwords"
 require "time"
 require "yaml"
+require_relative "../lib/dworkenv/preview_assets"
+require_relative "../lib/dworkenv/public_endpoint"
+require_relative "../lib/dworkenv/tailscale"
 
 class DiscourseProject
   attr_reader :root, :discourse_root, :plugin_name, :state_directory
@@ -120,10 +126,16 @@ class WorktreeEnvironment
     FileUtils.mkdir_p(@project.state_directory)
     File.open(File.join(@project.state_directory, "lock"), "w") do |lock|
       lock.flock(File::LOCK_EX)
+      @settings = File.file?(settings_path) ? JSON.parse(File.read(settings_path)) : {}
+      configure_start(arguments) if command == "up"
       case command
       when "up"
         start
         prepare
+        if @settings["tailscale"]
+          @settings["tailscale_url"] = tailscale.start(container, LABEL)
+          save_settings
+        end
         start_web
         puts url
       when "exec", "test", "qunit"
@@ -136,12 +148,15 @@ class WorktreeEnvironment
       when "url"
         puts url
       when "stop"
+        tailscale.stop
         docker("stop", @name) if container
       when "destroy"
+        tailscale.destroy
         docker("rm", "--force", @name) if container
         volumes =
           capture("docker", "volume", "ls", "--quiet", "--filter", "label=#{LABEL}=#{@root}").split
         docker("volume", "rm", *volumes) unless volumes.empty?
+        FileUtils.rm_f(settings_path)
         FileUtils.rm_rf(@source) if @project.plugin?
       end
     end
@@ -175,6 +190,44 @@ class WorktreeEnvironment
   end
 
   private
+
+  def settings_path
+    File.join(@project.state_directory, "preview.json")
+  end
+
+  def save_settings
+    File.write("#{settings_path}.new", JSON.pretty_generate(@settings))
+    File.rename("#{settings_path}.new", settings_path)
+  end
+
+  def configure_start(arguments)
+    settings = @settings.dup
+    options = OptionParser.new do |parser|
+      parser.on("--preview") { settings["preview"] = true }
+      parser.on("--live") { settings["preview"] = false }
+      parser.on("--tailscale") { settings["tailscale"] = true; settings.delete("public_url") }
+      parser.on("--no-tailscale") { settings["tailscale"] = false; settings.delete("tailscale_url") }
+      parser.on("--public-url URL") do |value|
+        settings["public_url"] = Dworkenv::PublicEndpoint.new(value).to_s
+        settings["tailscale"] = false
+        settings.delete("tailscale_url")
+      end
+      parser.on("--local") do
+        settings["tailscale"] = false
+        settings.delete("public_url")
+        settings.delete("tailscale_url")
+      end
+    end
+    options.parse!(arguments)
+    raise "Unexpected arguments" unless arguments.empty?
+    tailscale.stop if @settings["tailscale"] && !settings["tailscale"]
+    @settings = settings
+    save_settings
+  end
+
+  def tailscale
+    @tailscale ||= Dworkenv::Tailscale.new(@root, @volume_prefix)
+  end
 
   def capture(*command)
     output, status = Open3.capture2(*command)
@@ -274,6 +327,23 @@ class WorktreeEnvironment
     mounts
   end
 
+  def linked_plugins
+    Dir.glob("#{@source}/plugins/*").filter_map do |path|
+      next unless File.symlink?(path)
+      raise "Broken plugin symlink: #{path}" unless File.directory?(path)
+      real = File.realpath(path)
+      raise "Linked plugin has no plugin.rb: #{path}" unless File.file?(File.join(real, "plugin.rb"))
+      # Relative links inside the checkout already resolve through its bind mount.
+      next if !Pathname.new(File.readlink(path)).absolute? && real.start_with?("#{@source}/")
+      target = File.expand_path(File.readlink(path), File.dirname(path).sub(@source, WORKSPACE))
+      protected = %w[/etc /usr /bin /sbin /proc /sys /dev /run /shared /home/discourse]
+      if %w[/ /home /workspace].include?(target) || protected.any? { |prefix| target == prefix || target.start_with?("#{prefix}/") }
+        raise "Unsafe plugin symlink target: #{target}"
+      end
+      [real, target]
+    end.uniq
+  end
+
   def start
     @project.ensure_checkout
     if info = container
@@ -323,6 +393,18 @@ class WorktreeEnvironment
         "type=bind,source=#{@source},target=#{WORKSPACE}",
       ]
       arguments.concat(git_mounts(@source, WORKSPACE))
+      linked_plugins.each do |source, target|
+        arguments.concat(["--mount", "type=bind,source=#{source},target=#{target}"])
+        _output, _error, git_status = Open3.capture3("git", "-C", source, "rev-parse", "--git-dir")
+        if git_status.success?
+          git_mounts(source, target).each_slice(2) do |flag, mount|
+            arguments.concat([flag, mount]) unless arguments.include?(mount)
+          end
+        end
+        %w[node_modules gems auto_generated].each do |directory|
+          mounts["linked-#{Digest::SHA256.hexdigest(target)[0, 12]}-#{directory}"] = "#{target}/#{directory}"
+        end
+      end
       if @project.plugin?
         arguments.concat(["--mount", "type=bind,source=#{@root},target=#{plugin_path}"])
         arguments.concat(git_mounts(@root, plugin_path))
@@ -353,6 +435,12 @@ class WorktreeEnvironment
         .fetch("Mounts")
         .select { |mount| mount["Type"] == "volume" }
         .map { |mount| mount["Destination"] }
+    links = container.fetch("Mounts").select { |mount| mount["Type"] == "bind" }
+    linked_plugins.each do |source, target|
+      unless links.any? { |mount| mount["Source"] == source && mount["Destination"] == target }
+        raise "Linked plugins changed; recreate the environment to update their mounts"
+      end
+    end
     unless (volume_mounts.values - mounted).empty?
       raise "Workspace packages changed; destroy and recreate this environment to isolate their dependencies"
     end
@@ -384,6 +472,11 @@ class WorktreeEnvironment
       files += Dir.glob("{db/migrate,db/post_migrate}/*.rb", base: @root)
       files.sort.each do |path|
         fingerprint.update("plugin/#{path}").update(File.read("#{@root}/#{path}")) if File.file?("#{@root}/#{path}")
+      end
+    end
+    linked_plugins.each do |source, _target|
+      Dir.glob("{plugin.rb,Gemfile*,package.json,pnpm-lock.yaml,db/{migrate,post_migrate}/*.rb}", base: source).sort.each do |path|
+        fingerprint.update(source).update(path).update(File.read(File.join(source, path))) if File.file?(File.join(source, path))
       end
     end
     inside("bash", "-ec", <<~SH, "workenv", fingerprint.hexdigest)
@@ -423,38 +516,81 @@ class WorktreeEnvironment
     RUBY
   end
 
+  def asset_snapshot
+    script = File.read(File.expand_path("../lib/dworkenv/preview_assets.rb", __dir__))
+    output, error, result = Open3.capture3(
+      "docker", "exec", "-i", "--user", "discourse", "--workdir", WORKSPACE,
+      @name, "ruby", "-", stdin_data: script + "\nputs JSON.generate(Dworkenv::PreviewAssets.snapshot)\n",
+    )
+    raise "Could not fingerprint preview assets: #{error}" unless result.success?
+    JSON.parse(output).merge("image" => container.fetch("Image"))
+  end
+
+  def prepare_preview
+    current = asset_snapshot
+    marker = "/home/discourse/.cache/dworkenv-preview.json"
+    output, _error, result = Open3.capture3("docker", "exec", @name, "cat", marker)
+    begin
+      previous = JSON.parse(output) if result.success?
+    rescue JSON::ParserError
+      previous = nil
+    end
+    if Dworkenv::PreviewAssets.reusable?(current, previous)
+      warn "Source unchanged; reusing preview assets."
+    else
+      warn "Building preview assets once..."
+      docker("exec", @name, "sh", "-ec", "if [ -f /etc/service/workenv-web/run ]; then sv -w 30 down /etc/service/workenv-web; fi")
+      inside("rm", "-f", marker)
+      inside("pnpm", "--dir", "frontend/discourse", "build")
+      built = asset_snapshot
+      unless built["source"] == current["source"] && built["complete"]
+        raise "Source changed during the build or assets are incomplete; rerun dworkenv up"
+      end
+      inside("sh", "-ec", 'mkdir -p /home/discourse/.cache; printf "%s" "$1" > "$2"', "preview-cache", JSON.generate(built), marker)
+    end
+    # A live build's PID must not survive the transition to a static preview.
+    docker("exec", @name, "sh", "-ec", <<~SH)
+      if [ -f /etc/service/workenv-web/run ] && ! grep -q 'bin/dev --only=rails' /etc/service/workenv-web/run; then
+        sv -w 30 down /etc/service/workenv-web
+      fi
+    SH
+    inside("sh", "-ec", 'printf \'{"status":"ok"}\n\' > frontend/discourse/dist/manifest/build.json')
+  end
+
   def start_web
-    hostname = orbstack? ? "#{@name}.orb.local" : "localhost"
+    prepare_preview if @settings["preview"]
+    endpoint = Dworkenv::PublicEndpoint.new(url)
+    hostname = endpoint.hostname
     docker("exec", @name, "bash", "-ec", <<~SH)
       mkdir -p /etc/service/workenv-web
       cat > /etc/service/workenv-web/run.new <<'RUN'
       #!/bin/sh
       cd #{WORKSPACE}
-      export RAILS_DEVELOPMENT_HOSTS=localhost,127.0.0.1,#{hostname}
-      export DISCOURSE_HOSTNAME=#{hostname}
-      export DISCOURSE_PORT=#{orbstack? ? 443 : 3000}
-      export DISCOURSE_FORCE_HTTPS=#{orbstack? ? 1 : 0}
+      export RAILS_DEVELOPMENT_HOSTS=#{Shellwords.escape("localhost,127.0.0.1,#{@name}.orb.local,#{hostname}")}
+      export DISCOURSE_HOSTNAME=#{Shellwords.escape(hostname)}
+      export DISCOURSE_PORT=#{endpoint.uri.port}
+      export DISCOURSE_FORCE_HTTPS=#{endpoint.https? ? 1 : 0}
       export DISCOURSE_DEV_ALLOW_HTTPS=1
-      exec chpst -u discourse:discourse bin/dev >> log/workenv-web.log 2>&1
+      exec chpst -u discourse:discourse bin/dev#{@settings["preview"] ? " --only=rails" : ""} >> log/workenv-web.log 2>&1
       RUN
       action=up
       if ! cmp -s /etc/service/workenv-web/run.new /etc/service/workenv-web/run; then
+        if [ -f /etc/service/workenv-web/run ]; then action=restart; fi
         chmod +x /etc/service/workenv-web/run.new
         mv /etc/service/workenv-web/run.new /etc/service/workenv-web/run
-        action=restart
       else
         rm /etc/service/workenv-web/run.new
       fi
       for attempt in {1..10}; do
-        if sv "$action" /etc/service/workenv-web; then exit 0; fi
+        if sv -w 30 "$action" /etc/service/workenv-web; then exit 0; fi
         sleep 1
       done
       exit 1
     SH
     inside("bin/rake", "assets:precompile:build_plugins") if @project.plugin?
     warn "Waiting for #{url} (logs: docker exec #{@name} tail -f #{WORKSPACE}/log/workenv-web.log)..."
-    # OrbStack terminates TLS; readiness checks the app through its HTTP proxy.
-    address = URI(url.sub(/\Ahttps:/, "http:"))
+    # Reach the local backend even when the public origin is a remote TLS proxy.
+    address = URI("http://127.0.0.1:#{published_port}")
     deadline = Process.clock_gettime(Process::CLOCK_MONOTONIC) + 240
     loop do
       begin
@@ -465,8 +601,14 @@ class WorktreeEnvironment
             nil,
             open_timeout: 2,
             read_timeout: 5,
-          ) { |http| http.get("/") }
-        return if response.code.to_i.between?(200, 399)
+          ) do |http|
+            http.get("/", {
+              "Host" => "#{hostname}:#{endpoint.uri.port}",
+              "X-Forwarded-Proto" => endpoint.uri.scheme,
+              "User-Agent" => "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/130.0.0.0 Safari/537.36",
+            })
+          end
+        return if response.code.to_i == 200
       rescue SystemCallError, IOError, Timeout::Error, SocketError
       end
       if Process.clock_gettime(Process::CLOCK_MONOTONIC) >= deadline
@@ -493,10 +635,18 @@ class WorktreeEnvironment
   def url
     info = container
     raise "Environment is not running; use dworkenv up" unless info&.dig("State", "Running")
+    if @settings["tailscale"]
+      return @settings.fetch("tailscale_url") { raise "Tailscale is not ready; run dworkenv up" }
+    end
+    return @settings["public_url"] if @settings["public_url"]
     return "https://#{@name}.orb.local" if orbstack?
     port = info&.dig("NetworkSettings", "Ports", "3000/tcp")&.first&.fetch("HostPort")
     raise "Environment is not running; use dworkenv up" unless port
     "http://localhost:#{port}"
+  end
+
+  def published_port
+    container.dig("NetworkSettings", "Ports", "3000/tcp")&.first&.fetch("HostPort") || raise("No published HTTP port")
   end
 
   def orbstack?
@@ -507,9 +657,9 @@ end
 
 if $PROGRAM_NAME == __FILE__
   command = ARGV.shift
-  unless %w[up exec test qunit url stop destroy].include?(command)
+  unless %w[up exec test qunit url stop destroy auth-key].include?(command)
     puts <<~HELP
-      Usage: dworkenv <up|exec|test|qunit|url|stop|destroy>
+      Usage: dworkenv <up|exec|test|qunit|url|stop|destroy|auth-key>
 
         up                 Prepare this worktree and start its web server
         exec -- COMMAND    Prepare this worktree and run a command inside it
@@ -518,20 +668,35 @@ if $PROGRAM_NAME == __FILE__
         url                Print the running environment's URL
         stop               Stop the container, retaining its data
         destroy            Delete this worktree's container and all its volumes
+        auth-key           Save a reusable Tailscale key using a hidden prompt
+
+      Saved per-worktree options for up:
+        --preview          Build assets only after source changes; no frontend watcher
+        --live             Restore continuous frontend rebuilding (initial default)
+        --tailscale        Private HTTPS hostname using a Tailscale companion
+        --no-tailscale      Stop the companion and disable Tailscale access
+        --public-url URL   Set a public origin for your own reverse proxy
+        --local            Restore the default local URL and stop the companion
 
       Run from any directory within a Discourse or plugin checkout/worktree.
       Plugin environments download and pin Discourse automatically.
       DWORKENV_DISCOURSE_REF selects the initial Discourse branch, tag, or commit.
       DWORKENV_CACHE_HOME overrides the managed checkout/cache directory.
       DWORKENV_IMAGE overrides the image for newly created containers.
+      DWORKENV_TAILSCALE_AUTH_KEY_FILE overrides the reusable key's file path.
+      DWORKENV_TAILSCALE_IMAGE overrides the image for new companions.
     HELP
     exit(command.nil? || %w[help --help -h].include?(command) ? 0 : 1)
   end
   abort "Supply a command after exec --" if command == "exec" && (ARGV - ["--"]).empty?
-  abort "Unexpected arguments" if !%w[exec test qunit].include?(command) && !ARGV.empty?
+  abort "Unexpected arguments" if !%w[up exec test qunit].include?(command) && !ARGV.empty?
 
   begin
-    WorktreeEnvironment.new.run(command, ARGV)
+    if command == "auth-key"
+      Dworkenv::Tailscale.store_key
+    else
+      WorktreeEnvironment.new.run(command, ARGV)
+    end
   rescue StandardError => e
     abort "dworkenv: #{e.message}"
   end
