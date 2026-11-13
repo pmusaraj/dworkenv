@@ -13,6 +13,7 @@ module Dworkenv
       digest = Digest::SHA256.new.update("preview-assets-v1\0")
       visit = lambda do |relative, ancestors|
         next if EXCLUDED.include?(File.basename(relative)) || relative.end_with?(".tsbuildinfo")
+        next if relative == "app/assets/generated"
         path = File.join(root, relative)
         if File.directory?(path)
           real = File.realpath(path)

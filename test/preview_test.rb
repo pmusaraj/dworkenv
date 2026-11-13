@@ -41,6 +41,7 @@ class PreviewTest < Minitest::Test
     assert Dworkenv::PreviewAssets.reusable?(original, original)
     write("frontend/discourse/dist/manifest/build.json", '{"status":"ok"}')
     write("frontend/node_modules/generated.js", "ignored")
+    write("app/assets/generated/example/js/plugins/example.js", "compiled plugin")
     assert_equal original, snapshot
     File.unlink(bundle)
     refute Dworkenv::PreviewAssets.reusable?(snapshot, original)
@@ -49,6 +50,13 @@ class PreviewTest < Minitest::Test
     manifest[:other] = true
     write("frontend/discourse/dist/manifest/manifest.json", JSON.generate(manifest))
     refute Dworkenv::PreviewAssets.reusable?(snapshot, original)
+  end
+
+  def test_source_files_named_generated_are_still_hashed
+    source = write("app/assets/javascripts/generated/example.js", "one")
+    original = snapshot
+    File.write(source, "two")
+    refute_equal original["source"], snapshot["source"]
   end
 
   def test_linked_sources_are_hashed_and_cycles_are_skipped
